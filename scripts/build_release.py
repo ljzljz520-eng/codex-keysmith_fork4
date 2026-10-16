@@ -5,6 +5,7 @@ import argparse
 import base64
 import gzip
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -92,7 +93,82 @@ SCENARIO_METADATA_FIELDS = {
     "runtime",
     "requires",
     "checksums",
+    "security",
 }
+SCENARIO_SECURITY_FIELD = "security"
+SCENARIO_ISOLATION_MODES = {"strong", "best-effort"}
+SCENARIO_FILESYSTEM_GRANTS = {"read-only", "scratch-write"}
+SCENARIO_CAPABILITIES_FIELDS = {
+    "network",
+    "filesystem",
+    "max_cpu_seconds",
+    "max_wall_seconds",
+    "max_memory_mb",
+    "max_processes",
+    "max_output_bytes",
+}
+SCENARIO_SIGNATURE_PREFIX = "HS256:"
+SCENARIO_CAPABILITIES_PAYLOAD_TYPE = "codex-keysmith.scenario-capabilities/v1"
+# Must stay in sync with SCENARIO_FIRST_PARTY_KEY_HEX in codex-instruct.py.
+SCENARIO_FIRST_PARTY_KEY_HEX = (
+    "b500ac180958a662461e9c04247db2f7c33b99ecf8b6b16e9a4242bda06f47b4"
+)
+
+
+def _verify_scenario_security_contract(metadata: Dict[str, object], scenario_id: str) -> None:
+    security = metadata.get(SCENARIO_SECURITY_FIELD)
+    if not isinstance(security, dict) or set(security) != {
+        "isolation",
+        "capabilities",
+        "signature",
+    }:
+        raise ReleaseError("scenario security block is invalid: {}".format(scenario_id))
+    if security["isolation"] not in SCENARIO_ISOLATION_MODES:
+        raise ReleaseError("scenario isolation mode is invalid: {}".format(scenario_id))
+    capabilities = security["capabilities"]
+    if not isinstance(capabilities, dict) or set(capabilities) != SCENARIO_CAPABILITIES_FIELDS:
+        raise ReleaseError("scenario capabilities are invalid: {}".format(scenario_id))
+    if not isinstance(capabilities["network"], bool):
+        raise ReleaseError("scenario network capability is invalid: {}".format(scenario_id))
+    if capabilities["filesystem"] not in SCENARIO_FILESYSTEM_GRANTS:
+        raise ReleaseError("scenario filesystem grant is invalid: {}".format(scenario_id))
+    for limit_name in SCENARIO_CAPABILITIES_FIELDS - {"network", "filesystem"}:
+        value = capabilities[limit_name]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ReleaseError(
+                "scenario capability {} is invalid: {}".format(limit_name, scenario_id)
+            )
+    signature = security["signature"]
+    if (
+        not isinstance(signature, str)
+        or not signature.startswith(SCENARIO_SIGNATURE_PREFIX)
+        or not re.fullmatch(r"[0-9a-f]{64}", signature[len(SCENARIO_SIGNATURE_PREFIX):])
+    ):
+        raise ReleaseError("scenario capability signature is invalid: {}".format(scenario_id))
+    body = {
+        "typ": SCENARIO_CAPABILITIES_PAYLOAD_TYPE,
+        "id": metadata["id"],
+        "version": metadata["version"],
+        "task": metadata["task"],
+        "validator": metadata["validator"],
+        "verify": metadata["verify"],
+        "platforms": metadata["platforms"],
+        "runtime": metadata["runtime"],
+        "requires": metadata["requires"],
+        "checksums": metadata["checksums"],
+        "isolation": security["isolation"],
+        "capabilities": security["capabilities"],
+    }
+    canonical = json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    expected = SCENARIO_SIGNATURE_PREFIX + hmac.new(
+        bytes.fromhex(SCENARIO_FIRST_PARTY_KEY_HEX), canonical, hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise ReleaseError(
+            "scenario capability signature is invalid or untrusted: {}".format(scenario_id)
+        )
 
 
 def _validate_scenario_archive_path(relative_path: str) -> None:
@@ -385,6 +461,7 @@ def _build_scenario_index(members: Dict[str, bytes], version: str) -> Dict[str, 
                 raise ReleaseError(
                     "scenario checksum mismatch: {}/{}".format(scenario_id, relative)
                 )
+        _verify_scenario_security_contract(metadata, scenario_id)
         scenarios[scenario_id] = {
             "display_name": metadata["display_name"],
             "id": metadata["id"],

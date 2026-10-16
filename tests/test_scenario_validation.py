@@ -3,7 +3,6 @@ import importlib.util
 import json
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +14,11 @@ spec = importlib.util.spec_from_file_location("codex_instruct_scenario_validatio
 codex_instruct = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = codex_instruct
 spec.loader.exec_module(codex_instruct)
+
+requires_confinement_backend = pytest.mark.skipif(
+    codex_instruct._scenario_detect_strong_backend("auto") is None,
+    reason="strong isolation probes require an OS confinement backend",
+)
 
 
 def _copy_package(tmp_path):
@@ -39,7 +43,22 @@ def _refresh_checksums(package, data):
         relative: hashlib.sha256((package / relative).read_bytes()).hexdigest()
         for relative in data["checksums"]
     }
+    security = data.get("security")
+    if isinstance(security, dict) and "signature" in security:
+        security["signature"] = (
+            codex_instruct._scenario_compute_capability_signature(
+                data, codex_instruct._scenario_first_party_signing_key()
+            )
+        )
     _write_metadata(package, data)
+
+
+def _unsigned_security():
+    return {
+        "capabilities": dict(codex_instruct.SCENARIO_DEFAULT_CAPABILITIES),
+        "isolation": codex_instruct.SCENARIO_ISOLATION_STRONG,
+        "signature": codex_instruct.SCENARIO_SIGNATURE_PREFIX + "0" * 64,
+    }
 
 
 @pytest.mark.parametrize(
@@ -323,6 +342,7 @@ def test_discovery_reports_invalid_directory_and_node(tmp_path):
     assert "invalid node" in discovered["valid_node"][1]
 
 
+@requires_confinement_backend
 def test_static_blockers_report_platform_runtime_and_dependencies(tmp_path, monkeypatch):
     root, package_root = _copy_package(tmp_path)
     data = _metadata(package_root)
@@ -336,7 +356,7 @@ def test_static_blockers_report_platform_runtime_and_dependencies(tmp_path, monk
             "probe": ["tool", "--version"],
         }
     ]
-    _write_metadata(package_root, data)
+    _refresh_checksums(package_root, data)
     package = codex_instruct.load_scenario_package(root, "example_fixture")
     monkeypatch.setattr(codex_instruct, "_scenario_platform_name", lambda: "linux")
 
@@ -375,6 +395,7 @@ def test_requires_schema_rejects_shell_probe_explicitly():
         )
 
 
+@requires_confinement_backend
 def test_probe_reports_missing_command():
     blocker = codex_instruct._scenario_probe_requirement(
         {
@@ -390,6 +411,7 @@ def test_probe_reports_missing_command():
     assert "codex-keysmith-missing-tool" in blocker
 
 
+@requires_confinement_backend
 def test_probe_reports_missing_python_module():
     blocker = codex_instruct._scenario_probe_requirement(
         {
@@ -405,6 +427,7 @@ def test_probe_reports_missing_python_module():
     assert "No module named 'missing_mod_xyz'" in blocker
 
 
+@requires_confinement_backend
 def test_probe_reports_version_mismatch():
     blocker = codex_instruct._scenario_probe_requirement(
         {
@@ -419,6 +442,7 @@ def test_probe_reports_version_mismatch():
     assert "does not satisfy >=99.0" in blocker
 
 
+@requires_confinement_backend
 def test_probe_accepts_satisfied_python_module():
     assert (
         codex_instruct._scenario_probe_requirement(
@@ -433,15 +457,23 @@ def test_probe_accepts_satisfied_python_module():
     )
 
 
-def test_python_module_probe_rewrites_python_alias(monkeypatch):
+def test_python_module_probe_runs_confined(monkeypatch):
     seen = {}
 
-    def fake_run(command, **kwargs):
-        seen["command"] = command
+    def fake_run_confined(command, **kwargs):
+        seen["command"] = list(command)
         seen["kwargs"] = kwargs
-        return subprocess.CompletedProcess(command, 0, stdout="2024.03.5\n", stderr="")
+        return codex_instruct.ScenarioConfinementResult(
+            exit_code=0,
+            stdout="2024.03.5\n",
+            stderr="",
+            timed_out=False,
+            duration_seconds=0.01,
+            worker_error=None,
+            audit={"enforced_mode": "strong"},
+        )
 
-    monkeypatch.setattr(codex_instruct.subprocess, "run", fake_run)
+    monkeypatch.setattr(codex_instruct, "run_scenario_confined", fake_run_confined)
     blocker = codex_instruct._scenario_probe_requirement(
         {
             "name": "rdkit",
@@ -453,55 +485,11 @@ def test_python_module_probe_rewrites_python_alias(monkeypatch):
 
     assert blocker is None
     assert seen["command"][:3] == [sys.executable, "-E", "-B"]
-    assert seen["kwargs"]["shell"] is False
-    assert seen["kwargs"]["timeout"] == codex_instruct.SCENARIO_PROBE_TIMEOUT_SECONDS
+    assert seen["kwargs"]["declared_isolation"] == "strong"
+    assert seen["kwargs"]["purpose"] == "requires-probe"
+    assert seen["kwargs"]["capabilities"]["network"] is False
+    assert seen["kwargs"]["capabilities"]["filesystem"] == "read-only"
     assert seen["kwargs"]["cwd"] is not None
-    assert Path(seen["kwargs"]["cwd"]) == codex_instruct._scenario_probe_cwd(
-        {"type": "python-module"}
-    )
-    assert "PYTHONPATH" not in seen["kwargs"]["env"]
-    assert seen["kwargs"]["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
-
-
-@pytest.mark.parametrize(
-    ("is_windows", "interpreter_candidate"),
-    [(False, "python3"), (True, "python.exe")],
-)
-def test_frozen_python_module_probe_uses_path_interpreter_not_sidecar(
-    tmp_path, monkeypatch, is_windows, interpreter_candidate
-):
-    sidecar = tmp_path / ("codex-keysmith-cli.exe" if is_windows else "codex-keysmith-cli")
-    interpreter = tmp_path / interpreter_candidate
-    seen = {}
-
-    def fake_which(candidate):
-        seen.setdefault("candidates", []).append(candidate)
-        return str(interpreter) if candidate == interpreter_candidate else None
-
-    def fake_run(command, **kwargs):
-        seen["command"] = command
-        seen["kwargs"] = kwargs
-        return subprocess.CompletedProcess(command, 0, stdout="2024.03.5\n", stderr="")
-
-    monkeypatch.setattr(sys, "frozen", True, raising=False)
-    monkeypatch.setattr(sys, "executable", str(sidecar))
-    monkeypatch.setattr(codex_instruct, "_is_windows_platform", lambda: is_windows)
-    monkeypatch.setattr(codex_instruct.shutil, "which", fake_which)
-    monkeypatch.setattr(codex_instruct.subprocess, "run", fake_run)
-
-    blocker = codex_instruct._scenario_probe_requirement(
-        {
-            "name": "rdkit",
-            "type": "python-module",
-            "version": ">=2022.9",
-            "probe": ["python", "-c", "print('2024.03.5')"],
-        }
-    )
-
-    assert blocker is None
-    assert seen["command"][:3] == [str(interpreter), "-E", "-B"]
-    assert seen["command"][0] != str(sidecar)
-    assert Path(seen["kwargs"]["cwd"]) == interpreter.parent
 
 
 def test_frozen_python_module_probe_fails_clearly_without_interpreter(monkeypatch):
@@ -519,10 +507,11 @@ def test_frozen_python_module_probe_fails_clearly_without_interpreter(monkeypatc
     )
 
     assert blocker is not None
+    assert "strong isolation is unavailable" in blocker
     assert "frozen sidecar has no Python interpreter" in blocker
-    assert "ensure it is on PATH" in blocker
 
 
+@requires_confinement_backend
 def test_python_module_probe_isolates_cwd_and_pythonpath_without_bytecode(tmp_path, monkeypatch):
     module_name = "codex_keysmith_probe_shadow"
     fake_cwd = tmp_path / "caller"
@@ -553,6 +542,7 @@ def test_python_module_probe_isolates_cwd_and_pythonpath_without_bytecode(tmp_pa
     assert not list(tmp_path.rglob("__pycache__"))
 
 
+@requires_confinement_backend
 def test_probe_reports_timeout(monkeypatch):
     monkeypatch.setattr(codex_instruct, "SCENARIO_PROBE_TIMEOUT_SECONDS", 0.2)
     blocker = codex_instruct._scenario_probe_requirement(

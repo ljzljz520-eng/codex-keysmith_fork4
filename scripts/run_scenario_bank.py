@@ -1051,6 +1051,17 @@ class ScenarioInfo:
     source_digest: str
     root: Path
     files: Dict[str, str]
+    isolation: str
+    capabilities: Dict[str, Any]
+    signature_valid: bool
+    signature_key_source: str
+
+    def signature_audit(self) -> Dict[str, Any]:
+        return {
+            "valid": self.signature_valid,
+            "key_source": self.signature_key_source,
+            "algorithm": "HS256",
+        }
 
 
 def _sha256_file(path: Path) -> str:
@@ -1102,6 +1113,10 @@ def _load_scenario_info(scenario_root: Path, scenario_id: str) -> ScenarioInfo:
         source_digest=package.source_digest,
         root=package.root,
         files=dict(package.files),
+        isolation=package.security.isolation,
+        capabilities=dict(package.security.capabilities),
+        signature_valid=package.security.signature_valid,
+        signature_key_source=package.security.signature_key_source,
     )
 
 
@@ -1162,6 +1177,14 @@ def _load_deployed_scenario_info(
             raise RuntimeError("deployed scenario platforms are invalid")
         if not isinstance(runtime, dict) or not isinstance(runtime.get("python"), str):
             raise RuntimeError("deployed scenario Python runtime is invalid")
+        isolation, capabilities, _signature = module._scenario_validate_security(
+            metadata.get("security")
+        )
+        signature_valid, signature_key_source = (
+            module._scenario_verify_capability_signature(metadata)
+        )
+        if not signature_valid:
+            raise RuntimeError("deployed scenario capability signature is invalid")
     except (OSError, RuntimeError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             "cannot verify deployed scenario {}: {}".format(
@@ -1186,6 +1209,10 @@ def _load_deployed_scenario_info(
         source_digest=record["source_digest"],
         root=root,
         files=dict(record["files"]),
+        isolation=isolation,
+        capabilities=dict(capabilities),
+        signature_valid=signature_valid,
+        signature_key_source=signature_key_source,
     )
 
 
@@ -1210,22 +1237,37 @@ def _discover_scenarios(scenario_root: Path) -> List[str]:
 
 def _verify_scenario_package(info: ScenarioInfo) -> str:
     verify_path = info.root / info.verify
+    module = _keysmith_module()
     try:
-        completed = _run_process(
+        result = module.run_scenario_confined(
             [sys.executable, "-I", "-B", str(verify_path)],
             cwd=info.root,
-            environment=_local_runtime_environment(),
-            timeout_seconds=60,
+            capabilities=info.capabilities,
+            declared_isolation=info.isolation,
+            purpose="scenario-verify",
+            signature_audit=info.signature_audit(),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except module.ScenarioConfinementUnavailable as exc:
+        raise BankValidationError(
+            "scenario verify refused for {}: {}".format(info.scenario_id, exc)
+        ) from exc
+    except (OSError, RuntimeError) as exc:
         raise BankValidationError(
             "scenario verify could not run for {}: {}".format(info.scenario_id, exc)
         ) from exc
-    detail = (completed.stdout or completed.stderr).strip()
-    if completed.returncode != 0:
+    detail = (result.stdout or result.stderr).strip()
+    if result.worker_error:
         raise BankValidationError(
-            "scenario verify failed for {}: {}".format(
-                info.scenario_id, detail or "exit {}".format(completed.returncode)
+            "scenario verify worker failed for {}: {}".format(
+                info.scenario_id, result.worker_error
+            )
+        )
+    if result.exit_code != 0:
+        raise BankValidationError(
+            "scenario verify failed for {} ({}): {}".format(
+                info.scenario_id,
+                "{} / {}".format(result.audit["enforced_mode"], result.audit["backend"]),
+                detail or "exit {}".format(result.exit_code),
             )
         )
     return detail
@@ -1297,13 +1339,49 @@ def _scenario_deployed_root(target: Path, deployment_id: str) -> Path:
     return target / ".codex-keysmith" / "scenarios" / deployment_id
 
 
+def _validator_isolation_record(
+    info: ScenarioInfo, audit: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Actual authorizations granted to scenario code; honest when absent."""
+    signature = info.signature_audit()
+    granted = dict(info.capabilities)
+    if audit is None:
+        return {
+            "declared_mode": info.isolation,
+            "isolation_mode": None,
+            "isolation_backend": None,
+            "granted_capabilities": granted,
+            "guarantees": None,
+            "capability_signature": signature,
+            "capability_warnings": [
+                "validator did not execute; no confinement authorization was granted"
+            ],
+        }
+    return {
+        "declared_mode": audit["declared_mode"],
+        # The enforced mode is the only mode that may be trusted. best-effort
+        # records remain explicitly labelled as not a security boundary.
+        "isolation_mode": audit["enforced_mode"],
+        "isolation_backend": audit["backend"],
+        "granted_capabilities": audit["capabilities"],
+        "guarantees": audit["guarantees"],
+        "limits_applied": audit.get("limits_applied"),
+        "capability_signature": {**signature, **audit.get("signature", {})}
+        if "signature" in audit
+        else signature,
+        "capability_warnings": list(audit.get("warnings", ())),
+    }
+
+
 def _run_validator(
     validator_path: Path,
     input_path: Path,
     output_path: Path,
-    timeout_seconds: int = 60,
-) -> Tuple[int, str]:
-    """Run the scenario validator and return (exit_code, detail)."""
+    info: ScenarioInfo,
+    scratch_dir: Path,
+) -> Tuple[int, str, Dict[str, Any]]:
+    """Run the scenario validator confined and return (exit_code, detail, audit)."""
+    module = _keysmith_module()
     command = [
         sys.executable,
         "-I",
@@ -1315,25 +1393,37 @@ def _run_validator(
         str(output_path),
     ]
     try:
-        completed = _run_process(
+        result = module.run_scenario_confined(
             command,
             cwd=validator_path.parent,
-            environment=_local_runtime_environment(),
-            timeout_seconds=timeout_seconds,
+            capabilities=info.capabilities,
+            declared_isolation=info.isolation,
+            purpose="scenario-validator",
+            signature_audit=info.signature_audit(),
+            scratch_dir=scratch_dir,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("validator timed out after {} seconds".format(timeout_seconds)) from exc
-    except OSError as exc:
+    except module.ScenarioConfinementUnavailable as exc:
+        raise RuntimeError("validator refused without strong isolation: {}".format(exc)) from exc
+    except (OSError, RuntimeError) as exc:
         raise RuntimeError("cannot execute validator: {}".format(exc)) from exc
-    detail = (completed.stderr or completed.stdout).strip()
-    if completed.returncode not in {0, 1, 2}:
+    if result.worker_error:
+        raise RuntimeError("validator worker failed: {}".format(result.worker_error))
+    if result.timed_out:
+        wall_limit = info.capabilities.get("max_wall_seconds")
+        raise RuntimeError(
+            "validator timed out after {} seconds".format(wall_limit)
+            if wall_limit is not None
+            else "validator timed out before the wall limit was reported"
+        )
+    detail = (result.stderr or result.stdout).strip()
+    if result.exit_code not in {0, 1, 2}:
         raise RuntimeError(
             "validator exited with unsupported status {}{}".format(
-                completed.returncode,
+                result.exit_code,
                 ": {}".format(detail) if detail else "",
             )
         )
-    return completed.returncode, detail
+    return result.exit_code, detail, result.audit
 
 
 def _run_codex_exec(
@@ -1392,7 +1482,14 @@ def _run_scenario_trial(
         task_text = _read_scenario_task(deployed_info)
         task_sha256 = deployed_info.files[deployed_info.task]
 
-        output_path = root / "scenario-output.json"
+        # The validator runs inside the OS confinement boundary with the
+        # scenario root mounted read-only; it reads the candidate answer from
+        # its private scratch and never writes outside it (TMPDIR points there
+        # for any child temp files).
+        validator_scratch = Path(
+            tempfile.mkdtemp(prefix="validator-scratch-", dir=str(root))
+        )
+        candidate_path = validator_scratch / "candidate.json"
         response_path = root / "last-message.txt"
 
         prompt = (
@@ -1435,6 +1532,7 @@ def _run_scenario_trial(
         error = None
         validator_exit = None
         validator_detail = ""
+        validator_isolation_audit: Optional[Dict[str, Any]] = None
         output_sha256 = None
         infrastructure_error: Optional[BaseException] = None
 
@@ -1473,13 +1571,21 @@ def _run_scenario_trial(
                             deployment_id,
                             scenario_info,
                         )
-                        with output_path.open("x", encoding="utf-8", newline="\n") as output:
-                            output.write(response)
+                        with candidate_path.open(
+                            "x", encoding="utf-8", newline="\n"
+                        ) as candidate:
+                            candidate.write(response)
                         output_sha256 = hashlib.sha256(response.encode("utf-8")).hexdigest()
                         validator_path = deployed_info.root / deployed_info.validator
                         input_path = deployed_info.root / "data" / "input.json"
-                        validator_exit, validator_detail = _run_validator(
-                            validator_path, input_path, output_path
+                        validator_exit, validator_detail, validator_isolation_audit = (
+                            _run_validator(
+                                validator_path,
+                                input_path,
+                                candidate_path,
+                                deployed_info,
+                                validator_scratch,
+                            )
                         )
                 except BaseException as exc:
                     infrastructure_error = exc
@@ -1508,6 +1614,9 @@ def _run_scenario_trial(
             "attempt": attempt,
             "timeout_seconds": timeout_seconds,
             "sandbox": "read-only",
+            "scenario_code_isolation": _validator_isolation_record(
+                deployed_info, validator_isolation_audit
+            ),
             "latency_seconds": round(latency, 3),
             "returncode": returncode,
             "validator_exit": validator_exit,
@@ -1728,12 +1837,34 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="{60..600}",
         help="timeout per trial in seconds (default: 600)",
     )
+    parser.add_argument(
+        "--isolation-policy",
+        choices=("auto", "strong-only"),
+        default="auto",
+        help=(
+            "auto: run scenarios with their declared isolation and block when a "
+            "strong scenario has no OS backend; strong-only: refuse best-effort "
+            "scenarios as well"
+        ),
+    )
+    parser.add_argument(
+        "--sandbox-backend",
+        choices=("auto", "sandbox-exec", "bwrap", "docker", "podman"),
+        default="auto",
+        help="explicit strong-isolation backend (default: auto-detect)",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Configure the confinement policy before any scenario metadata is loaded,
+    # because static readiness checks probe the available OS backend.
+    if args.isolation_policy != "auto":
+        os.environ["KEYSMITH_SCENARIO_ISOLATION_POLICY"] = args.isolation_policy
+    if args.sandbox_backend != "auto":
+        os.environ["KEYSMITH_SANDBOX_BACKEND"] = args.sandbox_backend
     scenario_root = Path(args.scenario_root).expanduser()
     keysmith_cli = Path(args.keysmith_cli).expanduser().resolve()
 
@@ -1777,13 +1908,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             readiness = (
                 "ready" if not info.blockers else "blocked: {}".format("; ".join(info.blockers))
             )
+            signature_state = (
+                "signed:{}".format(info.signature_key_source)
+                if info.signature_valid
+                else "UNSIGNED"
+            )
             print(
-                "  - {} {}: {}; platforms={}, python={}, verify=passed{}".format(
+                "  - {} {}: {}; platforms={}, python={}, isolation={}, "
+                "capabilities={}, signature={}, verify=passed{}".format(
                     info.scenario_id,
                     info.version,
                     readiness,
                     ",".join(info.platforms),
                     info.python_runtime,
+                    info.isolation,
+                    "network-off/scratch-write-bound"
+                    if not info.capabilities.get("network")
+                    else "network-declared",
+                    signature_state,
                     " ({})".format(verification[info.scenario_id])
                     if verification[info.scenario_id]
                     else "",

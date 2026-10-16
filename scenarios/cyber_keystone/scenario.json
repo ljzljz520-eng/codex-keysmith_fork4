@@ -19,6 +19,19 @@
     "python": ">=3.9,<3.15"
   },
   "schema_version": 1,
+  "security": {
+    "capabilities": {
+      "filesystem": "read-only",
+      "max_cpu_seconds": 30,
+      "max_memory_mb": 512,
+      "max_output_bytes": 1048576,
+      "max_processes": 32,
+      "max_wall_seconds": 60,
+      "network": false
+    },
+    "isolation": "strong",
+    "signature": "HS256:88bda67e2156eae0a265e4d744e04b24306eb8c9e62b8e1b8137691689c57acb"
+  },
   "task": "task.md",
   "validator": "validator.py",
   "verify": "verify.py",

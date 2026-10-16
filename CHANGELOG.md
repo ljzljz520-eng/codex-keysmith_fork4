@@ -8,6 +8,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- Scenario 执行从“只校验字节一致”升级为强隔离执行模型：`scenario.json` 新增经 HMAC-SHA256 签名的 `security` 块（isolation 模式 + 七项 capability 声明，覆盖 entrypoint/requires/checksums）；verify、validator 与 `requires` 探测统一在一次性受限 worker 中运行（macOS seatbelt / Linux bubblewrap / docker·podman），默认只读输入、最小环境、禁网、CPU/内存/进程/墙钟限额、写操作限定 scratch，并通过窄 JSON IPC 回传结果；主进程对实际后端与限额做 fail-closed 审计，capability 或签名被篡改即拒绝。`best-effort` 模式在审计与报告中显式标注 “not a security boundary”，不得称为 sandbox；`KEYSMITH_SCENARIO_ISOLATION_POLICY=strong-only` 可禁止 best-effort 包执行。新增维护命令 `--sign-scenario-capabilities` 与 bank runner 的 `--isolation-policy` / `--sandbox-backend`；release 构建器独立验签，operator 可用 `KEYSMITH_SCENARIO_TRUSTED_KEY[_FILE]` 替换（而非追加）一方信任钥。
 - `--status` 报告 `instruction_slot`（`model_instructions_file` / `envelope-append`）、是否匹配实测默认 overlay，以及非空 `AGENTS.md` 竞态。unrestricted 等替换稿会提示改回 overlay 或 envelope-append。
 - `docs/series-eval.md` 与 `breaktest/series-bank.txt`：四套 Keysmith 共用 cell ID。
 

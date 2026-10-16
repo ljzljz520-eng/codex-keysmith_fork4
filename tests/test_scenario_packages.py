@@ -374,7 +374,9 @@ def test_chem_rdkit_deploy_blocked_without_rdkit(tmp_path):
 
 
 def test_chem_rdkit_lifecycle_when_probe_satisfied(tmp_path, monkeypatch):
-    monkeypatch.setattr(codex_instruct, "_scenario_probe_requirement", lambda _req: None)
+    monkeypatch.setattr(
+        codex_instruct, "_scenario_probe_requirement", lambda _req, isolation="strong": None
+    )
     monkeypatch.setattr(codex_instruct, "_scenario_platform_name", lambda: "darwin")
     target = _target(tmp_path)
     package = codex_instruct.load_scenario_package(SCENARIO_ROOT, "chem_rdkit")

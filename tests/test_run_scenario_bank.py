@@ -27,7 +27,14 @@ def scenario_bank_runner():
     return module
 
 
+def _skip_without_confinement_backend(scenario_bank_runner):
+    module = scenario_bank_runner._keysmith_module()
+    if module._scenario_detect_strong_backend("auto") is None:
+        pytest.skip("strong scenario isolation requires an OS confinement backend")
+
+
 def _ready_example(scenario_bank_runner):
+    _skip_without_confinement_backend(scenario_bank_runner)
     library = scenario_bank_runner._resolve_scenario_library(SCENARIOS_ROOT)
     info = scenario_bank_runner._load_scenario_info(library.packages_root, "example_fixture")
     assert info.blockers == ()
@@ -71,6 +78,7 @@ def _install_fake_subprocess_runtime(
 
 
 def test_validate_only_runs_full_package_verify(scenario_bank_runner, capsys):
+    _skip_without_confinement_backend(scenario_bank_runner)
     result = scenario_bank_runner.main(["--validate-only", "--scenario", "example_fixture"])
 
     captured = capsys.readouterr()
@@ -106,6 +114,7 @@ def test_validate_only_rejects_checksum_drift(scenario_bank_runner, tmp_path, ca
 
 
 def test_validate_only_accepts_sealed_bundle(scenario_bank_runner, tmp_path, capsys):
+    _skip_without_confinement_backend(scenario_bank_runner)
     bundle = tmp_path / "codex-keysmith-scenarios-v0.3.9.bundle"
     scenario_bank_runner._keysmith_module().write_scenario_bundle(SCENARIOS_ROOT, bundle)
 
@@ -201,6 +210,23 @@ def test_live_trial_reads_deployed_root_and_validates_final_response(
     assert record["validator_exit"] == 0
     assert record["scenario"]["source_digest"] == info.source_digest
     assert record["sandbox"] == "read-only"
+    isolation = record["scenario_code_isolation"]
+    assert isolation["declared_mode"] == "strong"
+    assert isolation["isolation_mode"] == "strong"
+    assert isolation["isolation_backend"] in {
+        "sandbox-exec",
+        "bwrap",
+        "docker",
+        "podman",
+    }
+    assert isolation["granted_capabilities"]["network"] is False
+    assert isolation["granted_capabilities"]["filesystem"] == "read-only"
+    assert isolation["guarantees"]["os_kernel_enforced"] is True
+    assert isolation["guarantees"]["network_denied"] is True
+    assert isolation["capability_signature"]["valid"] is True
+    assert isolation["capability_signature"]["key_source"] == (
+        "release-pinned-first-party"
+    )
     assert record["timeout_seconds"] == 60
     assert record["task_sha256"] == info.files[info.task]
     assert record["validator_sha256"] == info.files[info.validator]
@@ -546,21 +572,45 @@ def test_validator_infrastructure_error_preserves_paid_attempt(
     assert "validator timed out after 60 seconds" in records[1]["error"]
 
 
+def _fake_confinement_result(scenario_bank_runner, **fields):
+    module = scenario_bank_runner._keysmith_module()
+    defaults = {
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": "",
+        "timed_out": False,
+        "duration_seconds": 0.01,
+        "worker_error": None,
+        "audit": {"enforced_mode": "strong"},
+    }
+    defaults.update(fields)
+    return module.ScenarioConfinementResult(**defaults)
+
+
 def test_validator_timeout_is_not_a_validator_exit_code(
     scenario_bank_runner,
     monkeypatch,
     tmp_path,
 ):
-    def fake_run_process(command, **kwargs):
-        raise subprocess.TimeoutExpired(command, kwargs["timeout_seconds"])
+    _library, info = _ready_example(scenario_bank_runner)
+    module = scenario_bank_runner._keysmith_module()
+    monkeypatch.setattr(
+        module,
+        "run_scenario_confined",
+        lambda *args, **kwargs: _fake_confinement_result(
+            scenario_bank_runner, timed_out=True
+        ),
+    )
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
 
-    monkeypatch.setattr(scenario_bank_runner, "_run_process", fake_run_process)
-
-    with pytest.raises(RuntimeError, match="validator timed out after 60 seconds"):
+    with pytest.raises(RuntimeError, match=r"validator timed out after \d+ seconds"):
         scenario_bank_runner._run_validator(
             tmp_path / "validator.py",
             tmp_path / "input.json",
-            tmp_path / "output.json",
+            tmp_path / "candidate.json",
+            info,
+            scratch,
         )
 
 
@@ -569,16 +619,25 @@ def test_validator_unsupported_exit_is_infrastructure_failure(
     monkeypatch,
     tmp_path,
 ):
-    def fake_run_process(command, **_kwargs):
-        return subprocess.CompletedProcess(command, 3, "", "validator crashed")
-
-    monkeypatch.setattr(scenario_bank_runner, "_run_process", fake_run_process)
+    _library, info = _ready_example(scenario_bank_runner)
+    module = scenario_bank_runner._keysmith_module()
+    monkeypatch.setattr(
+        module,
+        "run_scenario_confined",
+        lambda *args, **kwargs: _fake_confinement_result(
+            scenario_bank_runner, exit_code=3, stderr="validator crashed"
+        ),
+    )
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
 
     with pytest.raises(RuntimeError, match="unsupported status 3"):
         scenario_bank_runner._run_validator(
             tmp_path / "validator.py",
             tmp_path / "input.json",
-            tmp_path / "output.json",
+            tmp_path / "candidate.json",
+            info,
+            scratch,
         )
 
 

@@ -30,6 +30,7 @@ import builtins
 import ctypes
 import errno
 import hashlib
+import hmac
 import importlib.util
 import io
 import json
@@ -38,17 +39,19 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import zipfile
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 # ─── 内置 GPT 破限指令内容 ──────────────────────────────────────────────────
 BUILTIN_GPT_UNRESTRICTED_MD = r"""Codex operates in local execution mode. This file is the workspace delivery
@@ -4359,6 +4362,111 @@ def _identity_from_portable(value: Any, label: str) -> FileIdentity:
 
 # ─── Target-local scenario deployment ───────────────────────────────────────
 
+SCENARIO_ISOLATION_STRONG = "strong"
+SCENARIO_ISOLATION_BEST_EFFORT = "best-effort"
+SCENARIO_ISOLATION_MODES = (
+    SCENARIO_ISOLATION_STRONG,
+    SCENARIO_ISOLATION_BEST_EFFORT,
+)
+SCENARIO_FILESYSTEM_READ_ONLY = "read-only"
+SCENARIO_FILESYSTEM_SCRATCH = "scratch-write"
+SCENARIO_FILESYSTEM_GRANTS = (
+    SCENARIO_FILESYSTEM_READ_ONLY,
+    SCENARIO_FILESYSTEM_SCRATCH,
+)
+SCENARIO_SECURITY_FIELD = "security"
+SCENARIO_CAPABILITIES_FIELDS = (
+    "network",
+    "filesystem",
+    "max_cpu_seconds",
+    "max_wall_seconds",
+    "max_memory_mb",
+    "max_processes",
+    "max_output_bytes",
+)
+SCENARIO_SECURITY_FIELDS = ("isolation", "capabilities", "signature")
+SCENARIO_CAPABILITIES_PAYLOAD_TYPE = "codex-keysmith.scenario-capabilities/v1"
+SCENARIO_SIGNATURE_ALGORITHM = "HS256"
+SCENARIO_SIGNATURE_PREFIX = "HS256:"
+# Release-pinned first-party HMAC key. Because it is a symmetric key embedded
+# in the released client, it provides tamper-evident binding between a
+# capability declaration and the payload bytes, not publisher authentication
+# against adversaries who hold the client. Operators pin an out-of-band key
+# through KEYSMITH_SCENARIO_TRUSTED_KEY / KEYSMITH_SCENARIO_TRUSTED_KEY_FILE.
+SCENARIO_FIRST_PARTY_KEY_HEX = (
+    "b500ac180958a662461e9c04247db2f7c33b99ecf8b6b16e9a4242bda06f47b4"
+)
+SCENARIO_TRUSTED_KEY_ENV = "KEYSMITH_SCENARIO_TRUSTED_KEY"
+SCENARIO_TRUSTED_KEY_FILE_ENV = "KEYSMITH_SCENARIO_TRUSTED_KEY_FILE"
+SCENARIO_SIGNING_KEY_ENV = "KEYSMITH_SCENARIO_SIGNING_KEY"
+SCENARIO_SIGNING_KEY_FILE_ENV = "KEYSMITH_SCENARIO_SIGNING_KEY_FILE"
+SCENARIO_BACKEND_ENV = "KEYSMITH_SANDBOX_BACKEND"
+SCENARIO_ISOLATION_POLICY_ENV = "KEYSMITH_SCENARIO_ISOLATION_POLICY"
+SCENARIO_SANDBOX_IMAGE_ENV = "KEYSMITH_SANDBOX_IMAGE"
+SCENARIO_DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
+SCENARIO_BEST_EFFORT_WARNING = (
+    "best-effort confinement is not a security boundary: network access is "
+    "not blocked and the process can still read credentials and write outside "
+    "the scratch directory"
+)
+SCENARIO_DEFAULT_CAPABILITIES = {
+    "network": False,
+    "filesystem": SCENARIO_FILESYSTEM_READ_ONLY,
+    "max_cpu_seconds": 30,
+    "max_wall_seconds": 60,
+    "max_memory_mb": 512,
+    "max_processes": 32,
+    "max_output_bytes": 1024 * 1024,
+}
+# Structured ``requires`` probes always run under a fixed, tighter profile;
+# probes are version checks and never need the scenario's full limits.
+SCENARIO_PROBE_CAPABILITIES = {
+    "network": False,
+    "filesystem": SCENARIO_FILESYSTEM_READ_ONLY,
+    "max_cpu_seconds": 2,
+    "max_wall_seconds": SCENARIO_PROBE_TIMEOUT_SECONDS,
+    "max_memory_mb": 256,
+    "max_processes": 8,
+    "max_output_bytes": 16 * 1024,
+}
+# Minimum environment exposed to scenario code. Anything not listed here is
+# stripped, including API credentials and shell configuration.
+SCENARIO_CONFINED_ENV_NAMES = (
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
+# Hard ceiling so a manifest typo cannot request an unbounded worker.
+SCENARIO_LIMIT_CEILINGS = {
+    "max_cpu_seconds": 600,
+    "max_wall_seconds": 900,
+    "max_memory_mb": 4096,
+    "max_processes": 512,
+    "max_output_bytes": 8 * 1024 * 1024,
+}
+SCENARIO_LIMIT_FLOORS = {
+    "max_cpu_seconds": 1,
+    "max_wall_seconds": 1,
+    "max_memory_mb": 16,
+    "max_processes": 1,
+    "max_output_bytes": 1024,
+}
+
+
+@dataclass(frozen=True)
+class ScenarioSecurity:
+    isolation: str
+    capabilities: Dict[str, Any]
+    signature: str
+    signature_valid: bool
+    signature_key_source: Optional[str]
+
 
 @dataclass(frozen=True)
 class ScenarioPackage:
@@ -4377,6 +4485,7 @@ class ScenarioPackage:
     requires: Tuple[Dict[str, Any], ...]
     files: Dict[str, str]
     source_digest: str
+    security: ScenarioSecurity
 
 
 @dataclass(frozen=True)
@@ -4726,15 +4835,6 @@ def _scenario_probe_command(requirement: Dict[str, Any]) -> List[str]:
     return probe
 
 
-def _scenario_probe_environment(requirement: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    if requirement["type"] != "python-module":
-        return None
-    environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    return environment
-
-
 def _scenario_probe_cwd(
     requirement: Dict[str, Any],
     command: Optional[List[str]] = None,
@@ -4756,31 +4856,41 @@ def _scenario_probe_detail(output: str, returncode: int) -> str:
     return lines[-1]
 
 
-def _scenario_probe_requirement(requirement: Dict[str, Any]) -> Optional[str]:
+def _scenario_probe_requirement(
+    requirement: Dict[str, Any],
+    isolation: str = SCENARIO_ISOLATION_STRONG,
+) -> Optional[str]:
     label = requirement["name"]
     specification = requirement["version"]
     try:
         command = _scenario_probe_command(requirement)
     except FileNotFoundError as exc:
         return (
-            f"dependency {label} ({specification}) probe could not run: {exc}; "
-            "install Python and ensure it is on PATH, then re-run the scenario command"
+            f"dependency {label} ({specification}) probe refused because strong "
+            f"isolation is unavailable ({exc}); install Python and ensure it is on "
+            "PATH, then re-run the scenario command"
         )
-    environment = _scenario_probe_environment(requirement)
-    probe_cwd = _scenario_probe_cwd(requirement, command)
+    probe_cwd = _scenario_probe_cwd(requirement, command) or Path.cwd()
     rendered = " ".join(command)
+    probe_capabilities = {
+        **SCENARIO_PROBE_CAPABILITIES,
+        "max_wall_seconds": SCENARIO_PROBE_TIMEOUT_SECONDS,
+    }
     try:
-        completed = subprocess.run(
+        probe_result = run_scenario_confined(
             command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=SCENARIO_PROBE_TIMEOUT_SECONDS,
-            shell=False,
-            cwd=probe_cwd,
-            env=environment,
+            cwd=Path(probe_cwd),
+            capabilities=probe_capabilities,
+            declared_isolation=isolation,
+            purpose="requires-probe",
         )
-    except FileNotFoundError:
+    except ScenarioConfinementUnavailable as exc:
+        return (
+            f"dependency {label} ({specification}) probe refused because strong "
+            f"isolation is unavailable ({exc}); install an OS confinement backend "
+            "or re-run on a host that provides one"
+        )
+    except FileNotFoundError as exc:
         if requirement["type"] == "python-module":
             return (
                 f"dependency {label} ({specification}) is missing; install python-module "
@@ -4789,21 +4899,33 @@ def _scenario_probe_requirement(requirement: Dict[str, Any]) -> Optional[str]:
             )
         return (
             f"dependency {label} ({specification}) is not on PATH; install command "
-            f"'{label}' or add it to PATH (probe: {rendered})"
+            f"'{label}' or add it to PATH (probe: {rendered}; detail: {exc})"
         )
-    except subprocess.TimeoutExpired:
+    if probe_result.worker_error and "FileNotFoundError" in probe_result.worker_error:
+        if requirement["type"] == "python-module":
+            return (
+                f"dependency {label} ({specification}) is missing; install python-module "
+                f"'{label}' into this Python environment and re-run the scenario command "
+                f"(probe: {rendered}; detail: {probe_result.worker_error})"
+            )
+        return (
+            f"dependency {label} ({specification}) is not on PATH; install command "
+            f"'{label}' or add it to PATH (probe: {rendered}; "
+            f"detail: {probe_result.worker_error})"
+        )
+    if probe_result.worker_error:
+        return (
+            f"dependency {label} ({specification}) probe worker failed: "
+            f"{probe_result.worker_error} (probe: {rendered})"
+        )
+    if probe_result.timed_out:
         return (
             f"dependency {label} ({specification}) probe timed out after "
             f"{SCENARIO_PROBE_TIMEOUT_SECONDS}s (probe: {rendered})"
         )
-    except OSError as exc:
-        return (
-            f"dependency {label} ({specification}) probe could not run: {exc} "
-            f"(probe: {rendered})"
-        )
-    output = "{}\n{}".format(completed.stdout or "", completed.stderr or "")
-    if completed.returncode != 0:
-        first_line = _scenario_probe_detail(output, completed.returncode)
+    output = "{}\n{}".format(probe_result.stdout or "", probe_result.stderr or "")
+    if probe_result.exit_code != 0:
+        first_line = _scenario_probe_detail(output, probe_result.exit_code or -1)
         if requirement["type"] == "python-module":
             return (
                 f"dependency {label} ({specification}) is missing; install python-module "
@@ -4812,7 +4934,7 @@ def _scenario_probe_requirement(requirement: Dict[str, Any]) -> Optional[str]:
             )
         return (
             f"dependency {label} ({specification}) probe failed with exit "
-            f"{completed.returncode}; install or repair '{label}' "
+            f"{probe_result.exit_code}; install or repair '{label}' "
             f"(probe: {rendered}; detail: {first_line})"
         )
     version = _scenario_extract_version(output)
@@ -4841,6 +4963,1020 @@ def _scenario_requires_summary(package: "ScenarioPackage") -> str:
     return ",".join(
         "{}{}".format(item["name"], item["version"]) for item in package.requires
     )
+
+
+# ---------------------------------------------------------------------------
+# One-shot scenario confinement
+#
+# Scenario code (verify.py / validator.py entrypoints and structured requires
+# probes) is executed by a trusted worker in a private scratch directory. Two
+# enforcement classes exist and they must never be conflated:
+#
+# * ``strong`` confinement is enforced by an OS boundary: macOS Seatbelt
+#   (sandbox-exec), Linux bubblewrap, or an explicit no-network container
+#   (docker/podman). Network access is denied at the kernel API, writes are
+#   confined to scratch, and credential-bearing directories are unreadable.
+# * ``best-effort`` confinement only scrubs the environment, moves the working
+#   directory into scratch, applies POSIX rlimits, and enforces a wall-clock
+#   timeout. It is NOT a security boundary and every audit record says so.
+#
+# Results cross the boundary through exactly one narrow channel: a strict,
+# size-capped JSON envelope file written mode 0600 by the worker.
+# ---------------------------------------------------------------------------
+
+SCENARIO_WORKER_REQUEST_SCHEMA = "keysmith.scenario-worker-request/v1"
+SCENARIO_WORKER_RESULT_SCHEMA = "keysmith.scenario-worker-result/v1"
+SCENARIO_WORKER_RESULT_KEYS = (
+    "schema",
+    "exit_code",
+    "timed_out",
+    "duration_seconds",
+    "peak_rss_kb",
+    "stdout",
+    "stdout_truncated",
+    "stderr",
+    "stderr_truncated",
+    "limits_applied",
+    "policy_digest",
+    "worker_error",
+)
+SCENARIO_WORKER_SOURCE = r"""#!/usr/bin/env python3
+# Trusted one-shot worker for codex-keysmith scenario confinement.
+#
+# Materialized by the main process into a private scratch directory. It never
+# receives credentials. It applies POSIX resource limits, runs exactly one
+# scenario command, captures bounded output, and returns a single strict JSON
+# envelope (the narrow IPC channel).
+import json
+import os
+import sys
+
+REQUEST_SCHEMA = "keysmith.scenario-worker-request/v1"
+RESULT_SCHEMA = "keysmith.scenario-worker-result/v1"
+
+
+def _apply_limits(limits, applied):
+    try:
+        import resource
+    except ImportError:
+        applied["cpu"] = False
+        applied["memory"] = False
+        applied["processes"] = "unavailable:no-resource-module"
+        return
+    try:
+        cpu = int(limit_or_zero(limits, "cpu_seconds"))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+        applied["cpu"] = True
+    except (ValueError, OSError) as exc:
+        applied["cpu"] = "unavailable:{}".format(exc.__class__.__name__)
+    try:
+        memory = int(limit_or_zero(limits, "memory_bytes"))
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_AS, (memory, memory))
+        applied["memory"] = True
+    except (ValueError, OSError) as exc:
+        applied["memory"] = "unavailable:{}".format(exc.__class__.__name__)
+    # RLIMIT_NPROC is accounted per real UID, not per worker: lowering it can
+    # make fork(2) fail immediately on a host already running other processes
+    # for that UID, and it cannot stop a co-UID process. It is therefore not
+    # an isolation primitive; the manifest limit is enforced natively by
+    # container backends (--pids-limit) and reported unsupported otherwise.
+    applied["processes"] = "unsupported:per-uid-rlimit"
+
+
+def limit_or_zero(limits, name):
+    value = limits.get(name, 0)
+    return value if isinstance(value, int) and value > 0 else 1
+
+
+def main():
+    if "--request" not in sys.argv:
+        sys.stderr.write("worker requires --request\n")
+        return 3
+    request_path = sys.argv[sys.argv.index("--request") + 1]
+    envelope = {
+        "schema": RESULT_SCHEMA,
+        "exit_code": None,
+        "timed_out": False,
+        "duration_seconds": 0.0,
+        "peak_rss_kb": 0,
+        "stdout": "",
+        "stdout_truncated": False,
+        "stderr": "",
+        "stderr_truncated": False,
+        "limits_applied": {},
+        "policy_digest": "",
+        "worker_error": None,
+    }
+    request = None
+    try:
+        import subprocess
+        import time
+
+        with open(request_path, "rb") as handle:
+            request = json.loads(handle.read().decode("utf-8"))
+        if not isinstance(request, dict) or request.get("schema") != REQUEST_SCHEMA:
+            raise ValueError("unsupported worker request schema")
+        envelope["policy_digest"] = str(request.get("policy_digest", ""))
+        limits = request["limits"]
+        _apply_limits(limits, envelope["limits_applied"])
+        stdin_value = request.get("stdin")
+        started = time.monotonic()
+        process = subprocess.Popen(
+            [str(part) for part in request["argv"]],
+            cwd=request["cwd"],
+            env=request["env"],
+            stdin=subprocess.PIPE if stdin_value is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(
+                input=stdin_value.encode("utf-8") if stdin_value is not None else None,
+                timeout=float(limits["wall_seconds"]),
+            )
+        except subprocess.TimeoutExpired:
+            envelope["timed_out"] = True
+            try:
+                os.killpg(os.getpgid(process.pid), 9)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                stdout, stderr = process.communicate()
+        envelope["duration_seconds"] = round(time.monotonic() - started, 3)
+        envelope["exit_code"] = process.returncode
+        try:
+            import resource
+
+            envelope["peak_rss_kb"] = int(
+                resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+            )
+        except (ImportError, OSError):
+            pass
+
+        def bounded(raw):
+            text = (raw or b"").decode("utf-8", errors="replace")
+            cap = int(request["max_output_bytes"])
+            return text[:cap], len(text) > cap
+
+        envelope["stdout"], envelope["stdout_truncated"] = bounded(stdout)
+        envelope["stderr"], envelope["stderr_truncated"] = bounded(stderr)
+    except BaseException as exc:  # delivered through the envelope
+        envelope["worker_error"] = "{}: {}".format(
+            exc.__class__.__name__, str(exc)
+        )[:500]
+    if request is None:
+        sys.stderr.write("worker could not parse its request\n")
+        return 3
+    result_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        result_flags |= os.O_NOFOLLOW
+    descriptor = os.open(request["result_path"], result_flags, 0o600)
+    try:
+        os.write(
+            descriptor,
+            json.dumps(envelope, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+        )
+    finally:
+        os.close(descriptor)
+    return 0 if envelope["worker_error"] is None else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+
+
+class ScenarioConfinementUnavailable(RuntimeError):
+    """Raised when strong isolation is required but no backend can enforce it."""
+
+
+@dataclass(frozen=True)
+class ScenarioConfinementCaps:
+    network: bool
+    filesystem: str
+    max_cpu_seconds: int
+    max_wall_seconds: int
+    max_memory_bytes: int
+    max_processes: int
+    max_output_bytes: int
+
+    @classmethod
+    def from_manifest(cls, capabilities: Dict[str, Any]) -> "ScenarioConfinementCaps":
+        return cls(
+            network=bool(capabilities["network"]),
+            filesystem=str(capabilities["filesystem"]),
+            max_cpu_seconds=int(capabilities["max_cpu_seconds"]),
+            max_wall_seconds=int(capabilities["max_wall_seconds"]),
+            max_memory_bytes=int(capabilities["max_memory_mb"]) * 1024 * 1024,
+            max_processes=int(capabilities["max_processes"]),
+            max_output_bytes=int(capabilities["max_output_bytes"]),
+        )
+
+    def canonical(self) -> Dict[str, Any]:
+        return {
+            "network": self.network,
+            "filesystem": self.filesystem,
+            "max_cpu_seconds": self.max_cpu_seconds,
+            "max_wall_seconds": self.max_wall_seconds,
+            "max_memory_bytes": self.max_memory_bytes,
+            "max_processes": self.max_processes,
+            "max_output_bytes": self.max_output_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class ScenarioConfinementResult:
+    exit_code: Optional[int]
+    stdout: str
+    stderr: str
+    timed_out: bool
+    duration_seconds: float
+    worker_error: Optional[str]
+    audit: Dict[str, Any]
+
+
+_SCENARIO_BACKEND_CACHE: Dict[str, Optional[Dict[str, str]]] = {}
+
+
+def _scenario_configured_backend_name() -> str:
+    return (os.environ.get(SCENARIO_BACKEND_ENV, "auto").strip() or "auto").lower()
+
+
+def _scenario_isolation_policy() -> str:
+    policy = (os.environ.get(SCENARIO_ISOLATION_POLICY_ENV, "auto").strip() or "auto").lower()
+    if policy not in ("auto", "strong-only"):
+        raise RuntimeError(
+            f"invalid {SCENARIO_ISOLATION_POLICY_ENV}: {policy} (expected auto or strong-only)"
+        )
+    return policy
+
+
+def _scenario_worker_interpreter() -> Path:
+    if getattr(sys, "frozen", False):
+        raise ScenarioConfinementUnavailable(
+            "the frozen sidecar carries no Python interpreter for confined workers"
+        )
+    return Path(sys.executable).resolve()
+
+
+def _scenario_bwrap_works(path: str) -> bool:
+    try:
+        completed = subprocess.run(
+            [path, "--unshare-net", "--ro-bind", "/", "/", "--die-with-parent", "true"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _scenario_detect_strong_backend(preferred: str) -> Optional[Dict[str, str]]:
+    """Select a usable strong-isolation backend, or None when unavailable."""
+    cache_key = preferred
+    if cache_key in _SCENARIO_BACKEND_CACHE:
+        cached = _SCENARIO_BACKEND_CACHE[cache_key]
+        return dict(cached) if cached is not None else None
+    selected: Optional[Dict[str, str]] = None
+    if preferred in ("docker", "podman"):
+        resolved = shutil.which(preferred)
+        if resolved:
+            selected = {"name": preferred, "path": resolved}
+    elif preferred == "sandbox-exec":
+        candidate = Path("/usr/bin/sandbox-exec")
+        if sys.platform == "darwin" and candidate.is_file():
+            selected = {"name": "sandbox-exec", "path": str(candidate)}
+    elif preferred == "bwrap":
+        resolved = shutil.which("bwrap")
+        if resolved and _scenario_bwrap_works(resolved):
+            selected = {"name": "bwrap", "path": resolved}
+    elif preferred == "auto":
+        if sys.platform == "darwin":
+            candidate = Path("/usr/bin/sandbox-exec")
+            if candidate.is_file():
+                selected = {"name": "sandbox-exec", "path": str(candidate)}
+        elif sys.platform.startswith("linux"):
+            resolved = shutil.which("bwrap")
+            if resolved and _scenario_bwrap_works(resolved):
+                selected = {"name": "bwrap", "path": resolved}
+    elif preferred != "best-effort":
+        raise RuntimeError(f"unknown {SCENARIO_BACKEND_ENV}: {preferred}")
+    _SCENARIO_BACKEND_CACHE[cache_key] = dict(selected) if selected else None
+    return dict(selected) if selected is not None else None
+
+
+def _scenario_confined_environment(scratch: Path) -> Dict[str, str]:
+    environment = {
+        name: os.environ[name]
+        for name in SCENARIO_CONFINED_ENV_NAMES
+        if name in os.environ and os.environ[name]
+    }
+    environment["HOME"] = str(scratch)
+    environment["USERPROFILE"] = str(scratch)
+    environment["TMPDIR"] = str(scratch)
+    environment["TEMP"] = str(scratch)
+    environment["TMP"] = str(scratch)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONUTF8"] = "1"
+    return environment
+
+
+def _scenario_darwin_denied_read_roots() -> Tuple[str, ...]:
+    # Credential-bearing and shared-system locations. Read access is broad by
+    # necessity (dyld resolves framework paths across OS versions); these
+    # explicit denials protect the locations that hold secrets.
+    return (
+        "/Users",
+        "/Volumes",
+        "/private/etc",
+        "/private/var/db",
+        "/private/var/folders",
+        "/private/tmp",
+        "/private/var/tmp",
+    )
+
+
+def _scenario_quote_scheme_path(path: str) -> str:
+    return json.dumps(path, ensure_ascii=False)
+
+
+def _scenario_build_seatbelt_profile(
+    scratch: Path,
+    carve_roots: Sequence[Path],
+    caps: ScenarioConfinementCaps,
+) -> str:
+    lines = ["(version 1)", "(deny default)", "(allow process*)",
+             "(allow signal (target self))", "(allow sysctl-read)",
+             "(allow file-read-metadata)", "(allow file-read*)"]
+    for root in _scenario_darwin_denied_read_roots():
+        lines.append(
+            "(deny file-read* (subpath {}))".format(_scenario_quote_scheme_path(root))
+        )
+    for root in [scratch, *carve_roots]:
+        lines.append(
+            "(allow file-read* (subpath {}))".format(
+                _scenario_quote_scheme_path(str(root))
+            )
+        )
+    lines.append(
+        "(allow file-write* (subpath {}))".format(
+            _scenario_quote_scheme_path(str(scratch))
+        )
+    )
+    lines.append(
+        "(allow file-write* (literal {}))".format(_scenario_quote_scheme_path("/dev/null"))
+    )
+    if caps.filesystem == SCENARIO_FILESYSTEM_READ_ONLY:
+        lines.append(
+            "(deny process-exec (subpath {}))".format(
+                _scenario_quote_scheme_path(str(scratch))
+            )
+        )
+    if caps.network:
+        lines.append("(allow network*)")
+    else:
+        lines.append("(deny network*)")
+    return "\n".join(lines) + "\n"
+
+
+def _scenario_build_bwrap_argv(
+    backend_path: str,
+    scratch: Path,
+    carve_roots: Sequence[Path],
+    environment: Dict[str, str],
+    cwd: Path,
+    caps: ScenarioConfinementCaps,
+    worker_argv: Sequence[str],
+) -> List[str]:
+    argv = [
+        backend_path, "--die-with-parent", "--new-session",
+        "--unshare-ipc", "--unshare-pid",
+    ]
+    if not caps.network:
+        argv.append("--unshare-net")
+    argv.extend(["--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"])
+    argv.extend(["--tmpfs", "/tmp"])
+    home = Path(os.path.expanduser("~")).resolve()
+    argv.extend(["--tmpfs", str(home)])
+    if os.geteuid() == 0:
+        argv.extend(["--tmpfs", "/root"])
+    for root in [scratch, *carve_roots]:
+        flag = "--bind" if root == scratch else "--ro-bind"
+        argv.extend([flag, str(root), str(root)])
+    argv.append("--clearenv")
+    for name in sorted(environment):
+        argv.extend(["--setenv", name, environment[name]])
+    argv.extend(["--chdir", str(cwd)])
+    argv.extend(worker_argv)
+    return argv
+
+
+def _scenario_build_container_argv(
+    engine: str,
+    scratch: Path,
+    carve_roots: Sequence[Path],
+    environment: Dict[str, str],
+    cwd: Path,
+    caps: ScenarioConfinementCaps,
+) -> Tuple[List[str], Dict[str, Any]]:
+    image = os.environ.get(SCENARIO_SANDBOX_IMAGE_ENV, SCENARIO_DEFAULT_SANDBOX_IMAGE)
+    container_scratch = "/worker"
+    mounts: List[str] = ["--volume", f"{scratch}:{container_scratch}:rw"]
+    container_roots: List[Dict[str, str]] = []
+    cwd_container = container_scratch
+    for index, root in enumerate(carve_roots):
+        target = f"/input/{index}"
+        mounts.extend(["--volume", f"{root}:{target}:ro"])
+        container_roots.append({"host": str(root), "container": target})
+        try:
+            cwd.relative_to(root)
+        except ValueError:
+            continue
+        cwd_container = "{}/{}".format(target, cwd.relative_to(root).as_posix())
+    argv = [engine, "run", "--rm", "--interactive",
+            "--network", "bridge" if caps.network else "none",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "--memory", f"{max(16, caps.max_memory_bytes // (1024 * 1024))}m",
+            "--memory-swap", f"{max(16, caps.max_memory_bytes // (1024 * 1024))}m",
+            "--cpus", "1",
+            "--pids-limit", str(caps.max_processes),
+            "--ulimit", f"cpu={caps.max_cpu_seconds}:{caps.max_cpu_seconds}",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "--workdir", cwd_container]
+    argv.extend(mounts)
+    for name in sorted(environment):
+        argv.extend(["--env", f"{name}={environment[name]}"])
+    argv.extend([image, "python3", "-I", "-B",
+                 f"{container_scratch}/worker.py", "--request",
+                 f"{container_scratch}/request.json"])
+    plan = {"image": image, "container_scratch": container_scratch,
+            "container_roots": container_roots, "cwd_container": cwd_container}
+    return argv, plan
+
+
+def _scenario_worker_request(
+    argv: Sequence[str],
+    cwd: Path,
+    environment: Dict[str, str],
+    scratch: Path,
+    caps: ScenarioConfinementCaps,
+    stdin_text: Optional[str],
+    *,
+    result_name: str = "result.json",
+) -> Tuple[Dict[str, Any], Path]:
+    result_path = scratch / result_name
+    request = {
+        "schema": SCENARIO_WORKER_REQUEST_SCHEMA,
+        "argv": [str(part) for part in argv],
+        "cwd": str(cwd),
+        "env": dict(environment),
+        "stdin": stdin_text,
+        "limits": {
+            "cpu_seconds": caps.max_cpu_seconds,
+            "wall_seconds": caps.max_wall_seconds,
+            "memory_bytes": caps.max_memory_bytes,
+            "processes": caps.max_processes,
+        },
+        "result_path": str(result_path),
+        "max_output_bytes": caps.max_output_bytes,
+    }
+    return request, result_path
+
+
+def _scenario_policy_digest(payload: Dict[str, Any]) -> str:
+    rendered = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def _scenario_parse_worker_envelope(
+    raw: bytes,
+    expected_digest: str,
+    caps: ScenarioConfinementCaps,
+) -> Dict[str, Any]:
+    headroom = 64 * 1024
+    max_size = caps.max_output_bytes * 2 + headroom
+    if len(raw) > max_size:
+        raise RuntimeError(
+            f"worker result envelope exceeds {max_size} bytes; refusing to parse"
+        )
+    try:
+        envelope = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"worker returned a malformed result envelope: {exc}") from exc
+    if not isinstance(envelope, dict) or set(envelope) != set(SCENARIO_WORKER_RESULT_KEYS):
+        raise RuntimeError("worker result envelope has an unexpected schema")
+    if envelope["schema"] != SCENARIO_WORKER_RESULT_SCHEMA:
+        raise RuntimeError("worker result envelope schema is unsupported")
+    if envelope["policy_digest"] != expected_digest:
+        raise RuntimeError("worker result envelope does not match the issued policy")
+    if envelope["exit_code"] is not None and not isinstance(envelope["exit_code"], int):
+        raise RuntimeError("worker result envelope exit_code is invalid")
+    if not isinstance(envelope["stdout"], str) or not isinstance(envelope["stderr"], str):
+        raise RuntimeError("worker result envelope output is invalid")
+    if len(envelope["stdout"]) > caps.max_output_bytes:
+        raise RuntimeError("worker stdout bypassed the configured output bound")
+    if len(envelope["stderr"]) > caps.max_output_bytes:
+        raise RuntimeError("worker stderr bypassed the configured output bound")
+    if not isinstance(envelope["limits_applied"], dict):
+        raise RuntimeError("worker limits report is invalid")
+    return envelope
+
+
+def _scenario_limit_applied(value: Any) -> bool:
+    return value is True
+
+
+def _scenario_build_audit(
+    *,
+    declared_mode: str,
+    enforced_mode: str,
+    backend: Optional[Dict[str, str]],
+    purpose: str,
+    caps: ScenarioConfinementCaps,
+    environment: Dict[str, str],
+    limits_applied: Optional[Dict[str, Any]],
+    policy_input: Dict[str, Any],
+    signature_audit: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    kernel_enforced = enforced_mode == SCENARIO_ISOLATION_STRONG
+    backend_name = backend["name"] if backend else (
+        "plain-process" if os.name == "nt" else "process-rlimits"
+    )
+    if kernel_enforced:
+        guarantees = {
+            "network_denied": not caps.network,
+            "writes_confined_to_scratch": True,
+            # All strong backends hide the host home: seatbelt/bwrap deny or
+            # mask it; containers mount neither the home directory nor env creds.
+            "home_credentials_denied": True,
+            "environment_minimized": True,
+            "cpu_limited": limits_applied is None
+            or _scenario_limit_applied(limits_applied.get("cpu")),
+            "memory_limited": limits_applied is None
+            or _scenario_limit_applied(limits_applied.get("memory")),
+            "processes_limited": backend_name in ("docker", "podman")
+            or (
+                limits_applied is not None
+                and _scenario_limit_applied(limits_applied.get("processes"))
+            ),
+            "wall_timeout_enforced": True,
+            "os_kernel_enforced": True,
+        }
+        scratch_noexec = backend_name == "sandbox-exec" and (
+            caps.filesystem == SCENARIO_FILESYSTEM_READ_ONLY
+        )
+    else:
+        guarantees = {
+            "network_denied": False,
+            "writes_confined_to_scratch": False,
+            "home_credentials_denied": False,
+            "environment_minimized": True,
+            "cpu_limited": limits_applied is not None
+            and _scenario_limit_applied(limits_applied.get("cpu")),
+            "memory_limited": limits_applied is not None
+            and _scenario_limit_applied(limits_applied.get("memory")),
+            "processes_limited": False,
+            "wall_timeout_enforced": True,
+            "os_kernel_enforced": False,
+        }
+        scratch_noexec = False
+    warnings: List[str] = []
+    if enforced_mode == SCENARIO_ISOLATION_BEST_EFFORT:
+        warnings.append(SCENARIO_BEST_EFFORT_WARNING)
+    if limits_applied:
+        for limit_name, limit_label in (
+            ("cpu", "CPU"),
+            ("memory", "memory"),
+            ("processes", "process count"),
+        ):
+            if not _scenario_limit_applied(limits_applied.get(limit_name)):
+                warnings.append(
+                    "{} limit was not enforced ({}): {}".format(
+                        limit_label,
+                        limits_applied.get(limit_name),
+                        "container backends enforce it natively"
+                        if backend_name in ("docker", "podman")
+                        else "host rlimit unsupported",
+                    )
+                )
+    audit = {
+        "declared_mode": declared_mode,
+        "enforced_mode": enforced_mode,
+        "backend": backend_name,
+        "purpose": purpose,
+        "capabilities": caps.canonical(),
+        "guarantees": guarantees,
+        "scratch_noexec": scratch_noexec,
+        "environment_names": sorted(environment),
+        "policy_sha256": _scenario_policy_digest(policy_input),
+        "limits_applied": dict(limits_applied) if limits_applied else None,
+        "warnings": warnings,
+    }
+    if signature_audit is not None:
+        audit["signature"] = signature_audit
+    return audit
+
+
+def _scenario_require_audit_consistency(
+    audit: Dict[str, Any], caps: ScenarioConfinementCaps
+) -> None:
+    """Fail closed when the audit does not prove the declared authorizations."""
+    guarantees = audit["guarantees"]
+    if audit["enforced_mode"] == SCENARIO_ISOLATION_STRONG:
+        if not guarantees["os_kernel_enforced"]:
+            raise RuntimeError("strong isolation audit lacks kernel enforcement")
+        if guarantees["network_denied"] != (not caps.network):
+            raise RuntimeError("network grant does not match the signed capabilities")
+        if caps.filesystem in SCENARIO_FILESYSTEM_GRANTS and not guarantees[
+            "writes_confined_to_scratch"
+        ]:
+            raise RuntimeError("filesystem grant was not confined to scratch")
+        if not guarantees["environment_minimized"] or not guarantees[
+            "wall_timeout_enforced"
+        ]:
+            raise RuntimeError("base confinement guarantees are missing")
+    elif audit["enforced_mode"] == SCENARIO_ISOLATION_BEST_EFFORT:
+        if guarantees["os_kernel_enforced"]:
+            raise RuntimeError("best-effort confinement must not claim kernel enforcement")
+        if guarantees["network_denied"] or guarantees["home_credentials_denied"]:
+            raise RuntimeError("best-effort confinement must not claim isolation guarantees")
+        if not any("not a security boundary" in warning for warning in audit["warnings"]):
+            raise RuntimeError("best-effort confinement must carry the explicit warning")
+    else:
+        raise RuntimeError("unknown confinement mode in audit")
+
+
+def _scenario_terminate_confined_process(process: subprocess.Popen) -> None:
+    if os.name == "nt":
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _scenario_resolve_carve_roots(
+    cwd: Path, read_only_roots: Sequence[Path], scratch: Path
+) -> List[Path]:
+    roots: List[Path] = []
+    seen: Set[str] = set()
+
+    def add(candidate: Path) -> None:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            roots.append(resolved)
+
+    add(cwd)
+    add(scratch)
+    for root in read_only_roots:
+        add(root)
+    return roots
+
+
+def run_scenario_confined(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    capabilities: Dict[str, Any],
+    declared_isolation: str,
+    purpose: str,
+    read_only_roots: Sequence[Path] = (),
+    stdin_text: Optional[str] = None,
+    signature_audit: Optional[Dict[str, Any]] = None,
+    scratch_dir: Optional[Path] = None,
+) -> ScenarioConfinementResult:
+    """Run one scenario command in a one-shot confined worker.
+
+    Raises ScenarioConfinementUnavailable when a strong scenario cannot get a
+    strong backend. Best-effort is never substituted silently. When
+    ``scratch_dir`` is supplied it is used verbatim (caller-managed); this is
+    how callers collect files the scenario writes, since the default scratch is
+    destroyed as soon as the worker exits.
+    """
+    if scratch_dir is None:
+        with tempfile.TemporaryDirectory(prefix="codex-keysmith-worker-") as raw_scratch:
+            return _run_scenario_confined(
+                argv,
+                cwd=cwd,
+                capabilities=capabilities,
+                declared_isolation=declared_isolation,
+                purpose=purpose,
+                read_only_roots=read_only_roots,
+                stdin_text=stdin_text,
+                signature_audit=signature_audit,
+                scratch=Path(raw_scratch),
+            )
+    owned_scratch = Path(scratch_dir)
+    owned_scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return _run_scenario_confined(
+        argv,
+        cwd=cwd,
+        capabilities=capabilities,
+        declared_isolation=declared_isolation,
+        purpose=purpose,
+        read_only_roots=read_only_roots,
+        stdin_text=stdin_text,
+        signature_audit=signature_audit,
+        scratch=owned_scratch,
+    )
+
+
+def _run_scenario_confined(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    capabilities: Dict[str, Any],
+    declared_isolation: str,
+    purpose: str,
+    read_only_roots: Sequence[Path],
+    stdin_text: Optional[str],
+    signature_audit: Optional[Dict[str, Any]],
+    scratch: Path,
+) -> ScenarioConfinementResult:
+    if declared_isolation not in SCENARIO_ISOLATION_MODES:
+        raise RuntimeError(f"unknown declared isolation mode: {declared_isolation}")
+    caps = ScenarioConfinementCaps.from_manifest(capabilities)
+    policy = _scenario_isolation_policy()
+    if policy == "strong-only" and declared_isolation != SCENARIO_ISOLATION_STRONG:
+        raise ScenarioConfinementUnavailable(
+            "operator policy requires strong isolation but scenario declares best-effort"
+        )
+    enforced_mode = declared_isolation
+    backend: Optional[Dict[str, str]] = None
+    container_plan: Optional[Dict[str, Any]] = None
+    profile: Optional[str] = None
+    if enforced_mode == SCENARIO_ISOLATION_STRONG:
+        backend = _scenario_detect_strong_backend(_scenario_configured_backend_name())
+        if backend is None:
+            raise ScenarioConfinementUnavailable(
+                "scenario declares strong isolation but no kernel confinement "
+                "backend is available on this host (sandbox-exec on macOS, "
+                "bubblewrap on Linux, or an explicit docker/podman backend)"
+            )
+
+    cwd = cwd.resolve()
+    if True:
+        scratch = scratch.resolve()
+        carve_roots = _scenario_resolve_carve_roots(cwd, read_only_roots, scratch)
+        environment = _scenario_confined_environment(scratch)
+        interpreter = (
+            _scenario_worker_interpreter()
+            if os.name != "nt"
+            else Path(sys.executable).resolve()
+        )
+        if enforced_mode == SCENARIO_ISOLATION_STRONG and backend and backend["name"] in (
+            "sandbox-exec",
+            "bwrap",
+        ):
+            # A venv may live under the operator home; carve out exactly the
+            # interpreter prefix (read-only) rather than the whole home.
+            for prefix in (sys.prefix, sys.base_prefix):
+                if prefix and Path(prefix).exists():
+                    resolved_prefix = Path(prefix).resolve()
+                    if resolved_prefix not in carve_roots:
+                        carve_roots.append(resolved_prefix)
+
+        worker_argv_host = [str(interpreter), "-I", "-B",
+                            str(scratch / "worker.py"), "--request",
+                            str(scratch / "request.json")]
+
+        if backend and backend["name"] in ("docker", "podman"):
+            request, result_path = _scenario_worker_request(
+                argv, cwd, environment, scratch, caps, stdin_text
+            )
+            container_argv, container_plan = _scenario_build_container_argv(
+                backend["name"], scratch, carve_roots, environment, cwd, caps
+            )
+            container_scratch = container_plan["container_scratch"]
+            container_request = json.loads(json.dumps(request))
+            container_request["result_path"] = f"{container_scratch}/result.json"
+            container_request["cwd"] = container_plan["cwd_container"]
+            for item in container_plan["container_roots"]:
+                host_prefix = item["host"]
+                container_prefix = item["container"]
+                container_request["argv"] = [
+                    arg.replace(host_prefix, container_prefix, 1)
+                    if isinstance(arg, str) and arg.startswith(host_prefix)
+                    else arg
+                    for arg in container_request["argv"]
+                ]
+            # The host interpreter path does not exist inside the image.
+            container_request["argv"] = [
+                "python3" if arg == str(interpreter) else arg
+                for arg in container_request["argv"]
+            ]
+            request_for_worker = container_request
+            launch_argv = container_argv
+            request_bytes = _scenario_json_bytes(container_request)
+        else:
+            request, result_path = _scenario_worker_request(
+                argv, cwd, environment, scratch, caps, stdin_text
+            )
+            request_for_worker = request
+            profile = None
+            if backend and backend["name"] == "sandbox-exec":
+                profile = _scenario_build_seatbelt_profile(scratch, carve_roots, caps)
+                launch_argv = [
+                    backend["path"], "-f", str(scratch / "profile.sb"), *worker_argv_host
+                ]
+            elif backend and backend["name"] == "bwrap":
+                launch_argv = _scenario_build_bwrap_argv(
+                    backend["path"], scratch, carve_roots, environment, cwd, caps,
+                    worker_argv_host,
+                )
+            elif os.name == "nt":
+                launch_argv = [str(part) for part in argv]
+            else:
+                launch_argv = worker_argv_host
+
+        policy_digest = _scenario_policy_digest(request_for_worker)
+        request_for_worker["policy_digest"] = policy_digest
+        request_bytes = _scenario_json_bytes(request_for_worker)
+        (scratch / "worker.py").write_text(SCENARIO_WORKER_SOURCE, encoding="utf-8")
+        os.chmod(str(scratch / "worker.py"), 0o700)
+        if backend and backend["name"] == "sandbox-exec":
+            (scratch / "profile.sb").write_text(profile, encoding="utf-8")
+            os.chmod(str(scratch / "profile.sb"), 0o600)
+        descriptor = os.open(
+            str(scratch / "request.json"),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            | (getattr(os, "O_NOFOLLOW", 0) or 0),
+            0o600,
+        )
+        try:
+            os.write(descriptor, request_bytes)
+        finally:
+            os.close(descriptor)
+
+        using_engine = bool(backend and backend["name"] in ("docker", "podman"))
+        # The worker enforces the wall budget itself when it can signal its
+        # child (bwrap/containers/plain). Some kernel backends (macOS
+        # seatbelt) forbid a confined worker from signalling even its own
+        # child, so the parent always retains a hard kill deadline over the
+        # whole confined process group.
+        outer_timeout = caps.max_wall_seconds + (60 if using_engine else 5)
+        started = time.monotonic()
+        process = subprocess.Popen(
+            launch_argv,
+            cwd=str(scratch) if using_engine else str(cwd),
+            # The engine CLI keeps the host environment; nothing from it is
+            # passed into the container (only explicit --env entries).
+            env=dict(os.environ) if using_engine else environment,
+            stdin=subprocess.DEVNULL if using_engine
+            else (subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name != "nt",
+        )
+        worker_error: Optional[str] = None
+        timed_out = False
+        try:
+            raw_stdout, raw_stderr = process.communicate(
+                input=None if using_engine else stdin_text,
+                timeout=outer_timeout if os.name != "nt" else caps.max_wall_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _scenario_terminate_confined_process(process)
+            try:
+                raw_stdout, raw_stderr = process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                raw_stdout, raw_stderr = process.communicate()
+
+        duration = round(time.monotonic() - started, 3)
+        exit_code: Optional[int] = process.returncode
+        stdout_text = (raw_stdout or b"").decode("utf-8", errors="replace")
+        stderr_text = (raw_stderr or b"").decode("utf-8", errors="replace")
+        limits_applied: Optional[Dict[str, Any]] = None
+
+        direct_windows = os.name == "nt" and enforced_mode != SCENARIO_ISOLATION_STRONG
+        if timed_out and not direct_windows:
+            # The parent killed the whole confined process group at the hard
+            # wall deadline (seatbelt workers may be unable to signal their
+            # own child). No result written under that condition is trusted;
+            # report the kill from launcher-side evidence alone. This path is
+            # only reached on backends that block cross-process signals (i.e.
+            # macOS seatbelt), where the memory/process rlimits could not be
+            # enforced anyway -- say so instead of claiming them.
+            raw_stdout, raw_stderr = b"", b""
+            stdout_text, stderr_text = "", ""
+            exit_code = process.returncode
+            limits_applied = {
+                "cpu": True,
+                "memory": "unavailable:host-rlimit",
+                "processes": "unsupported:per-uid-rlimit",
+            }
+        elif not direct_windows:
+            try:
+                raw_envelope = result_path.read_bytes()
+            except OSError as exc:
+                raise RuntimeError(
+                    "confined worker produced no result envelope "
+                    "(exit {}): {} | {}".format(
+                        process.returncode,
+                        stderr_text[:400],
+                        exc,
+                    )
+                ) from exc
+            try:
+                parsed_envelope = _scenario_parse_worker_envelope(
+                    raw_envelope, policy_digest, caps
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "{}; launcher stderr: {}".format(exc, stderr_text[:400])
+                ) from exc
+            if parsed_envelope["worker_error"]:
+                worker_error = parsed_envelope["worker_error"]
+            limits_applied = parsed_envelope["limits_applied"]
+            timed_out = bool(parsed_envelope["timed_out"])
+            exit_code = parsed_envelope["exit_code"]
+            duration = float(parsed_envelope["duration_seconds"])
+            stdout_text = parsed_envelope["stdout"]
+            stderr_text = parsed_envelope["stderr"]
+        else:
+            # Windows best-effort: the target ran directly, so bound output and
+            # label the result honestly (no envelope, no worker guarantees).
+            stdout_text = stdout_text[: caps.max_output_bytes]
+            stderr_text = stderr_text[: caps.max_output_bytes]
+
+        policy_input = {
+            "backend": backend,
+            "profile": profile,
+            "launch_argv": [str(part) for part in launch_argv],
+            "request": request_for_worker,
+            "carve_roots": [str(root) for root in carve_roots],
+            "container_plan": container_plan,
+        }
+        audit = _scenario_build_audit(
+            declared_mode=declared_isolation,
+            enforced_mode=enforced_mode,
+            backend=backend,
+            purpose=purpose,
+            caps=caps,
+            environment=environment,
+            limits_applied=limits_applied,
+            policy_input=policy_input,
+            signature_audit=signature_audit,
+        )
+        _scenario_require_audit_consistency(audit, caps)
+        return ScenarioConfinementResult(
+            exit_code=exit_code,
+            stdout=stdout_text,
+            stderr=stderr_text,
+            timed_out=timed_out,
+            duration_seconds=duration,
+            worker_error=worker_error,
+            audit=audit,
+        )
+
+
+def scenario_isolation_ready(security: ScenarioSecurity) -> Optional[str]:
+    """Static readiness check used by scenario lists and bank validation."""
+    policy = _scenario_isolation_policy()
+    if security.isolation == SCENARIO_ISOLATION_BEST_EFFORT:
+        if policy == "strong-only":
+            return (
+                "operator policy requires strong isolation but scenario declares "
+                "best-effort (not a security boundary)"
+            )
+        return None
+    backend = _scenario_detect_strong_backend(_scenario_configured_backend_name())
+    if backend is None:
+        return (
+            "strong isolation is declared but no OS confinement backend is "
+            "available; scenario code will not run unconfined (install "
+            "sandbox-exec/bubblewrap or configure KEYSMITH_SANDBOX_BACKEND)"
+        )
+    return None
 
 
 def _scenario_validate_requires(value: Any) -> Tuple[Dict[str, Any], ...]:
@@ -4882,6 +6018,228 @@ def _scenario_validate_requires(value: Any) -> Tuple[Dict[str, Any], ...]:
     return tuple(result)
 
 
+# ---------------------------------------------------------------------------
+# Scenario capability declarations and signatures
+#
+# File checksums (``checksums``) only prove which bytes were downloaded. They
+# cannot prove that executing those bytes will not read credentials, modify
+# the surrounding project, or open network sockets. Every scenario therefore
+# declares the capabilities its Python entrypoints and structured probes need
+# in ``scenario.json`` -> ``security``. The declaration is signed and bound to
+# the exact payload bytes, so capability downgrades and byte swaps are both
+# rejected before any scenario code runs.
+# ---------------------------------------------------------------------------
+
+
+def _scenario_int_limit(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"scenario capability {label} must be an integer")
+    floor = SCENARIO_LIMIT_FLOORS[label]
+    ceiling = SCENARIO_LIMIT_CEILINGS[label]
+    if not floor <= value <= ceiling:
+        raise ValueError(
+            f"scenario capability {label} must be between {floor} and {ceiling}"
+        )
+    return value
+
+
+def _scenario_validate_capabilities(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(SCENARIO_CAPABILITIES_FIELDS):
+        raise ValueError("scenario capabilities are invalid")
+    if not isinstance(value["network"], bool):
+        raise ValueError("scenario capability network must be a boolean")
+    if value["filesystem"] not in SCENARIO_FILESYSTEM_GRANTS:
+        raise ValueError("scenario capability filesystem is invalid")
+    return {
+        "network": value["network"],
+        "filesystem": value["filesystem"],
+        "max_cpu_seconds": _scenario_int_limit(value["max_cpu_seconds"], "max_cpu_seconds"),
+        "max_wall_seconds": _scenario_int_limit(
+            value["max_wall_seconds"], "max_wall_seconds"
+        ),
+        "max_memory_mb": _scenario_int_limit(value["max_memory_mb"], "max_memory_mb"),
+        "max_processes": _scenario_int_limit(value["max_processes"], "max_processes"),
+        "max_output_bytes": _scenario_int_limit(
+            value["max_output_bytes"], "max_output_bytes"
+        ),
+    }
+
+
+def _scenario_validate_security(value: Any) -> Tuple[str, Dict[str, Any], str]:
+    """Structurally validate the security block; signature is checked later."""
+    if not isinstance(value, dict) or set(value) != set(SCENARIO_SECURITY_FIELDS):
+        raise ValueError("scenario security block is invalid")
+    isolation = value["isolation"]
+    if isolation not in SCENARIO_ISOLATION_MODES:
+        raise ValueError("scenario security isolation mode is invalid")
+    capabilities = _scenario_validate_capabilities(value["capabilities"])
+    signature = value["signature"]
+    if not isinstance(signature, str):
+        raise ValueError("scenario capability signature must be a string")
+    expected_signature_length = len(SCENARIO_SIGNATURE_PREFIX) + 64
+    if (
+        not signature.startswith(SCENARIO_SIGNATURE_PREFIX)
+        or len(signature) != expected_signature_length
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", signature[len(SCENARIO_SIGNATURE_PREFIX):]
+        )
+    ):
+        raise ValueError("scenario capability signature is invalid")
+    return isolation, capabilities, signature
+
+
+def _scenario_capability_signing_bytes(metadata: Dict[str, Any]) -> bytes:
+    """Canonical bytes covered by the capability signature.
+
+    The signature binds the declared isolation mode and capabilities to every
+    executable surface: entrypoint paths, structured probes, platforms,
+    runtime requirements, and the SHA-256 of every deployed payload file.
+    """
+    security = metadata[SCENARIO_SECURITY_FIELD]
+    body = {
+        "typ": SCENARIO_CAPABILITIES_PAYLOAD_TYPE,
+        "id": metadata["id"],
+        "version": metadata["version"],
+        "task": metadata["task"],
+        "validator": metadata["validator"],
+        "verify": metadata["verify"],
+        "platforms": metadata["platforms"],
+        "runtime": metadata["runtime"],
+        "requires": metadata["requires"],
+        "checksums": metadata["checksums"],
+        "isolation": security["isolation"],
+        "capabilities": security["capabilities"],
+    }
+    return json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _scenario_decode_hex_key(value: str, label: str) -> bytes:
+    try:
+        key = bytes.fromhex(value.strip())
+    except ValueError:
+        raise ValueError(f"{label} must be 64 hex characters (32 bytes)") from None
+    if len(key) != 32:
+        raise ValueError(f"{label} must be 64 hex characters (32 bytes)")
+    return key
+
+
+def _scenario_trusted_signing_keys() -> Tuple[Tuple[str, bytes], ...]:
+    """Return (label, key) pairs accepted for capability signatures.
+
+    Operator-provided keys replace the release-pinned first-party key; they
+    never augment it, so a pinned host cannot be downgraded to first-party.
+    """
+    keys: List[Tuple[str, bytes]] = []
+    inline = os.environ.get(SCENARIO_TRUSTED_KEY_ENV, "").strip()
+    if inline:
+        keys.append(("operator-pinned", _scenario_decode_hex_key(inline, SCENARIO_TRUSTED_KEY_ENV)))
+    key_file = os.environ.get(SCENARIO_TRUSTED_KEY_FILE_ENV, "").strip()
+    if key_file:
+        try:
+            raw = Path(key_file).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise RuntimeError(f"cannot read trusted scenario key file: {exc}") from exc
+        keys.append(
+            (
+                "operator-pinned-file",
+                _scenario_decode_hex_key(raw, SCENARIO_TRUSTED_KEY_FILE_ENV),
+            )
+        )
+    if keys:
+        return tuple(keys)
+    return (
+        (
+            "release-pinned-first-party",
+            _scenario_decode_hex_key(SCENARIO_FIRST_PARTY_KEY_HEX, "first-party key"),
+        ),
+    )
+
+
+def _scenario_first_party_signing_key() -> bytes:
+    inline = os.environ.get(SCENARIO_SIGNING_KEY_ENV, "").strip()
+    if inline:
+        return _scenario_decode_hex_key(inline, SCENARIO_SIGNING_KEY_ENV)
+    key_file = os.environ.get(SCENARIO_SIGNING_KEY_FILE_ENV, "").strip()
+    if key_file:
+        raw = Path(key_file).read_text(encoding="utf-8").strip()
+        return _scenario_decode_hex_key(raw, SCENARIO_SIGNING_KEY_FILE_ENV)
+    return _scenario_decode_hex_key(SCENARIO_FIRST_PARTY_KEY_HEX, "first-party key")
+
+
+def _scenario_compute_capability_signature(metadata: Dict[str, Any], key: bytes) -> str:
+    digest = hmac.new(
+        key, _scenario_capability_signing_bytes(metadata), hashlib.sha256
+    ).hexdigest()
+    return SCENARIO_SIGNATURE_PREFIX + digest
+
+
+def _scenario_verify_capability_signature(
+    metadata: Dict[str, Any],
+) -> Tuple[bool, Optional[str]]:
+    declared = metadata[SCENARIO_SECURITY_FIELD]["signature"]
+    for label, key in _scenario_trusted_signing_keys():
+        expected = _scenario_compute_capability_signature(metadata, key)
+        if hmac.compare_digest(expected, declared):
+            return True, label
+    return False, None
+
+
+def sign_scenario_library_capabilities(scenario_root: Path) -> List[str]:
+    """Refresh capability signatures for every package in a source library.
+
+    Maintenance-only helper. It reads scenario.json directly instead of going
+    through load_scenario_package(), because a package with a stale signature
+    could never be loaded for re-signing otherwise. Checksums are signed as
+    declared; refresh them first if payload files changed.
+    """
+    key = _scenario_first_party_signing_key()
+    signed: List[str] = []
+    for name in sorted(_FILESYSTEM.list_directory_names(scenario_root)):
+        if not SCENARIO_ID_RE.fullmatch(name):
+            continue
+        package_root = scenario_root / name
+        if _classify_node(package_root).kind != "directory":
+            continue
+        metadata_path = package_root / "scenario.json"
+        content, _fingerprint = _read_regular_bytes_with_fingerprint(
+            metadata_path, "scenario.json"
+        )
+        try:
+            metadata = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"scenario.json is invalid: {metadata_path}") from exc
+        if not isinstance(metadata, dict) or metadata.get("id") != name:
+            raise HooksConflict(f"scenario id does not match its package: {name}")
+        security = metadata.get(SCENARIO_SECURITY_FIELD)
+        if not isinstance(security, dict):
+            raise HooksConflict(f"scenario {name} declares no security block to sign")
+        if security.get("isolation") not in SCENARIO_ISOLATION_MODES:
+            raise HooksConflict(f"scenario {name} has an invalid isolation mode")
+        _scenario_validate_capabilities(security.get("capabilities"))
+        _scenario_validate_requires(metadata.get("requires"))
+        security["signature"] = _scenario_compute_capability_signature(metadata, key)
+        rendered = _scenario_json_bytes(metadata)
+        temporary_path = package_root / ".scenario.json.signing.tmp"
+        descriptor = os.open(
+            str(temporary_path),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            | (getattr(os, "O_NOFOLLOW", 0) or 0),
+            0o600,
+        )
+        try:
+            os.write(descriptor, rendered)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary_path, metadata_path)
+        _fsync_directory(package_root)
+        signed.append(name)
+    if not signed:
+        raise HooksConflict(f"no scenario packages found in {scenario_root}")
+    return signed
+
+
 def load_scenario_package(root: Path, scenario_id: str) -> ScenarioPackage:
     if not SCENARIO_ID_RE.fullmatch(scenario_id):
         raise ValueError(f"invalid scenario id: {scenario_id}")
@@ -4914,6 +6272,7 @@ def load_scenario_package(root: Path, scenario_id: str) -> ScenarioPackage:
         "runtime",
         "requires",
         "checksums",
+        SCENARIO_SECURITY_FIELD,
     }
     if not isinstance(metadata, dict) or set(metadata) != expected_fields:
         raise ValueError("scenario.json root fields are invalid")
@@ -4944,6 +6303,9 @@ def load_scenario_package(root: Path, scenario_id: str) -> ScenarioPackage:
         raise ValueError("scenario Python runtime is invalid")
     _scenario_python_version_matches(python_runtime)
     requires = _scenario_validate_requires(metadata["requires"])
+    security_isolation, security_capabilities, security_signature = (
+        _scenario_validate_security(metadata.get(SCENARIO_SECURITY_FIELD))
+    )
     checksums = metadata["checksums"]
     if not isinstance(checksums, dict):
         raise ValueError("scenario checksums must be an object")
@@ -4978,6 +6340,20 @@ def load_scenario_package(root: Path, scenario_id: str) -> ScenarioPackage:
             raise ValueError(f"scenario checksum is invalid: {relative}")
         if files[relative] != expected:
             raise HooksConflict(f"scenario checksum mismatch: {scenario_root / relative}")
+    # Integrity is established first; only now verify that the signed
+    # capability declaration matches the authenticated payload bytes.
+    signature_valid, signature_key_source = _scenario_verify_capability_signature(metadata)
+    if not signature_valid:
+        raise HooksConflict(
+            f"scenario capability signature is invalid or untrusted: {scenario_id}"
+        )
+    security = ScenarioSecurity(
+        isolation=security_isolation,
+        capabilities=security_capabilities,
+        signature=security_signature,
+        signature_valid=True,
+        signature_key_source=signature_key_source,
+    )
     return ScenarioPackage(
         library_root=root,
         library_root_identity=root_identity,
@@ -4994,6 +6370,7 @@ def load_scenario_package(root: Path, scenario_id: str) -> ScenarioPackage:
         requires=requires,
         files=files,
         source_digest=_scenario_source_digest(files),
+        security=security,
     )
 
 
@@ -7008,6 +8385,9 @@ def _scenario_static_blockers(package: ScenarioPackage) -> List[str]:
         blockers.append(
             f"platform {platform} is not declared; supported: {', '.join(package.platforms)}"
         )
+    isolation_blocker = scenario_isolation_ready(package.security)
+    if isolation_blocker:
+        blockers.append(isolation_blocker)
     try:
         runtime_matches = _scenario_python_version_matches(package.python_runtime)
     except ValueError as exc:
@@ -7022,10 +8402,13 @@ def _scenario_static_blockers(package: ScenarioPackage) -> List[str]:
                     package.python_runtime,
                 )
             )
-    for requirement in package.requires:
-        blocker = _scenario_probe_requirement(requirement)
-        if blocker:
-            blockers.append(blocker)
+    if not isolation_blocker:
+        for requirement in package.requires:
+            blocker = _scenario_probe_requirement(
+                requirement, package.security.isolation
+            )
+            if blocker:
+                blockers.append(blocker)
     return blockers
 
 
@@ -17321,6 +18704,15 @@ Examples:
         action="store_true",
         help="Preview or recover one interrupted target-local scenario transaction",
     )
+    operation_group.add_argument(
+        "--sign-scenario-capabilities",
+        action="store_true",
+        help=_localized(
+            "用仓库一方密钥重签 scenario.json 中声明的 capability（维护操作，需 --scenario-root）",
+            "Re-sign declared capabilities in scenario.json with the first-party "
+            "key (maintenance; requires --scenario-root)",
+        ),
+    )
     parser.add_argument(
         "--yes",
         action="store_true",
@@ -17453,6 +18845,7 @@ Examples:
             or args.scenario_status
             or args.scenario_uninstall
             or args.scenario_recover
+            or args.sign_scenario_capabilities
             or args.target_dir
             or args.scenario_root
         ):
@@ -17473,6 +18866,7 @@ Examples:
         or args.scenario_status
         or args.scenario_uninstall
         or args.scenario_recover
+        or args.sign_scenario_capabilities
     )
     if scenario_operation:
         if (
@@ -17486,6 +18880,26 @@ Examples:
             parser.error(
                 "scenario commands conflict with instruction deployment options"
             )
+        if args.sign_scenario_capabilities:
+            if args.target_dir or args.yes or args.deploy_scenario:
+                parser.error(
+                    "--sign-scenario-capabilities accepts only --scenario-root and --lang"
+                )
+            try:
+                root = resolve_scenario_root(args.scenario_root)
+                signed = sign_scenario_library_capabilities(root)
+            except (OSError, ValueError) as exc:
+                _print(f"[Error] {exc}")
+                sys.exit(1)
+            _print(
+                _localized(
+                    "已重签 scenario capability 声明：{}".format(", ".join(signed)),
+                    "Re-signed scenario capability declarations: {}".format(
+                        ", ".join(signed)
+                    ),
+                )
+            )
+            return
         if args.scenario_list:
             if args.target_dir or args.yes:
                 parser.error("--scenario-list accepts only --scenario-root and --lang")
